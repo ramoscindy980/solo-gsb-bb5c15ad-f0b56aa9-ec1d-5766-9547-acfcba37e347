@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>分支访谈脚本编辑器</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="app">
+  <!-- sidebar -->
+  <aside class="sidebar">
+    <h1>分支访谈编辑器<small>Branch Interview Editor</small></h1>
+    <div class="btns">
+      <button class="primary" id="btnNew">＋ 新建脚本</button>
+      <button id="btnSample">载入示例脚本</button>
+    </div>
+    <div class="list" id="scriptList"></div>
+  </aside>
+
+  <!-- main -->
+  <div class="main">
+    <div class="toolbar">
+      <input class="title-input" id="scriptName" value="" placeholder="脚本名称">
+      <button id="btnAddNode">＋ 添加问题节点</button>
+      <button id="btnPort" title="从其他已保存脚本复制入口可达的分支到当前画布">🔀 跨脚本移植</button>
+      <button id="btnUndo" title="撤销 (Ctrl/Cmd+Z)" disabled>↶ 撤销</button>
+      <button id="btnRedo" title="重做 (Shift+Ctrl/Cmd+Z)" disabled>↷ 重做</button>
+      <button class="primary" id="btnSave">保存 (Ctrl+S)</button>
+      <div class="spacer"></div>
+      <button id="btnPreview">▶ 运行预览</button>
+      <button id="btnCoverage" title="按已保存运行记录统计各选项被选择次数">📊 分支覆盖</button>
+      <button id="btnImpact" title="以当前画布（含未保存修改）重放核对全部预览与分享作答，找出受改稿影响的会话">🩺 改稿影响分析</button>
+      <button id="btnRoute" title="勾选 1～6 个已连接选项，规划经过它们到达终点的最短选择序列">🧭 路线规划</button>
+      <button id="btnI18n" title="为脚本维护目标语言译文：按节点/选项 ID 编辑标题、正文与选项译文，原文改动后译文标为待复核">🌐 多语言译文<span id="i18nBadge" class="i18n-badge" style="display:none"></span></button>
+      <button id="btnFunnel" title="选择某个已创建的分享快照，按每次作答的节点+选项顺序构建路径前缀树漏斗（到达/停止/完成/占父比例），点击前缀查看会话 ID">📈 分享路径漏斗</button>
+      <button id="btnShare">🔗 只读分享</button>
+      <button id="btnExport">导出 JSON</button>
+      <button id="btnImport">导入 JSON</button>
+      <input type="file" id="importFile" accept="application/json,.json" hidden>
+    </div>
+    <div class="toolbar" style="padding-top:6px;padding-bottom:6px;">
+      <div class="status" id="status"></div>
+    </div>
+
+    <div class="canvas-wrap" id="canvasWrap">
+      <div id="world">
+        <svg id="edges" width="4000" height="3000">
+          <path id="tempEdge" class="edge dangle" style="display:none;pointer-events:none"></path>
+        </svg>
+      </div>
+      <div class="connecting-tip" id="connectingTip">松开鼠标连接到目标节点（ESC 取消）</div>
+      <div class="canvas-hint">
+        拖动节点标题移动 · 拖拽选项右侧圆点连线 · 点击连线修改/删除<br>
+        Ctrl/Cmd+Z 撤销 · Shift+Ctrl/Cmd+Z 重做 · 空白处拖动平移画布 ·
+        <b style="color:var(--cycle)">红=环路</b> /
+        <b style="color:var(--orphan)">橙虚线=孤立</b> /
+        <b style="color:var(--uncovered)">紫=未覆盖出口</b> ·
+        <b style="color:var(--coverage)">📊 分支覆盖=选项被选择次数</b>
+      </div>
+    </div>
+  </div>
+
+  <!-- inspector -->
+  <aside class="inspector" id="inspector"></aside>
+</div>
+
+<!-- preview modal -->
+<div class="modal-mask" id="previewModal">
+  <div class="modal wide">
+    <header>运行预览<span class="close" data-close="previewModal">✕</span></header>
+    <div class="body">
+      <div class="preview-grid">
+        <div id="previewCard"></div>
+        <div>
+          <div class="path-list">
+            <h4>回答路径记录</h4>
+            <div id="runPath"></div>
+          </div>
+          <div style="margin-top:10px"><button id="runRestart">↺ 重新开始</button></div>
+        </div>
+      </div>
+    </div>
+    <footer>
+      <button data-close="previewModal">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- coverage modal -->
+<div class="modal-mask" id="coverageModal">
+  <div class="modal wide">
+    <header>分支覆盖统计<span class="close" data-close="coverageModal">✕</span></header>
+    <div class="body">
+      <div id="coverageSummary"></div>
+      <div id="coverageList"></div>
+    </div>
+    <footer>
+      <button id="coverageRefresh">↻ 刷新统计</button>
+      <button data-close="coverageModal">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- revision impact modal -->
+<div class="modal-mask" id="impactModal">
+  <div class="modal wide">
+    <header>改稿影响分析<span class="close" data-close="impactModal">✕</span></header>
+    <div class="body">
+      <p class="route-tip">
+        以<b>当前画布（含未保存修改）</b>为基准，对本脚本的<b>运行预览</b>与<b>只读分享作答</b>记录逐条重放：
+        服务端从当前起点按历史选项顺序核对每一步跳转目标，发现
+        <b>起点改变 / 节点或选项消失 / 跳转改指 / 提前终止 / 已结束答卷不再结束</b>时，
+        返回<b>首个断点</b>及原因；未完成答卷只核对已答部分，完全匹配标为<b>兼容</b>。<br>
+        分析为<b>只读计算</b>：不保存脚本、不改写作答记录、不改变分支覆盖统计。
+      </p>
+      <div id="impactSummary"></div>
+      <div id="impactList"></div>
+    </div>
+    <footer>
+      <button id="impactRefresh">↻ 重新分析当前画布</button>
+      <button data-close="impactModal">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- route plan modal -->
+<div class="modal-mask" id="routeModal">
+  <div class="modal wide">
+    <header>指定选项路线规划<span class="close" data-close="routeModal">✕</span></header>
+    <div class="body">
+      <p class="route-tip">
+        勾选 <b>1～6</b> 个已连接目标的选项，求从<b>起始节点</b>出发、经过每个勾选选项至少一次、
+        最终到达<b>终止节点（含无选项节点）</b>的最短选择序列（以选择次数计）。
+        搜索允许环路和重复访问节点，但标记为终止的节点不可继续选择；无可行路线时明确显示无解，不返回部分路径。<br>
+        规划基于<b>当前画布</b>（含未保存修改）只读计算：不会保存脚本，也不生成运行记录或改变分支覆盖统计。
+      </p>
+      <div class="route-pick" id="routePick"></div>
+      <div class="route-actions">
+        <span class="route-count" id="routePickCount">已选 0/6</span>
+        <button class="primary" id="routeRun" disabled>🧭 开始规划</button>
+      </div>
+      <div id="routeResult"></div>
+    </div>
+    <footer>
+      <button data-close="routeModal">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- cross-script port modal -->
+<div class="modal-mask" id="portModal">
+  <div class="modal">
+    <header>跨脚本移植分支<span class="close" data-close="portModal">✕</span></header>
+    <div class="body">
+      <p style="margin:0 0 12px;color:var(--muted);font-size:13px">
+        从<b>当前脚本以外</b>的已保存脚本选择入口节点，入口可达的全部节点与内部选项连接会被一次性复制到当前画布；
+        节点和选项会重新生成 ID，内部跳转引用统一重写，环路或多路径汇合也只复制一次，原本无效或未连接的目标保持未连接。
+        新分支按原相对坐标放在当前视野附近，不会覆盖当前起始节点，整次移植计为一次撤销。</p>
+      <div class="field">
+        <label for="portScript">来源脚本</label>
+        <select id="portScript"></select>
+      </div>
+      <div class="field">
+        <label for="portEntry">入口节点（从该节点出发复制可达分支）</label>
+        <select id="portEntry"></select>
+      </div>
+      <div class="port-summary" id="portSummary"></div>
+    </div>
+    <footer>
+      <button data-close="portModal">取消</button>
+      <button class="primary" id="portConfirm">移植到当前画布</button>
+    </footer>
+  </div>
+</div>
+
+<!-- multilingual translation modal -->
+<div class="modal-mask" id="i18nModal">
+  <div class="modal wide">
+    <header>🌐 多语言译文<span class="close" data-close="i18nModal">✕</span></header>
+    <div class="body">
+      <p class="route-tip">
+        为脚本维护<b>一个目标语言</b>，按<b>节点/选项 ID</b> 编辑标题、正文与选项文案的译文。
+        保存脚本后，若原文字段发生改动，对应译文自动标为<b>待复核</b>，需重新核对保存；
+        删除节点或选项后其译文立即删除，<b>不会套到新对象</b>。创建只读分享时可选择该语言，
+        分享快照只冻结当时<b>已复核</b>的译文，作答页缺失或待复核字段自动回退原文，
+        选项 ID、跳转与作答记录始终沿用原脚本。
+      </p>
+
+      <!-- target language config -->
+      <div class="i18n-lang-row">
+        <div class="field" style="flex:0 0 150px;margin:0">
+          <label for="i18nCode">目标语言代码（BCP-47，如 en / ja / zh-TW）</label>
+          <input id="i18nCode" type="text" placeholder="en" spellcheck="false">
+        </div>
+        <div class="field" style="flex:1;margin:0">
+          <label for="i18nLabel">语言名称（如 English / 日本語）</label>
+          <input id="i18nLabel" type="text" placeholder="English">
+        </div>
+        <button class="primary" id="i18nSaveLang" style="align-self:flex-end">保存语言</button>
+      </div>
+      <div id="i18nLangHint" class="i18n-lang-hint"></div>
+
+      <!-- counts + filters -->
+      <div id="i18nSummary" class="i18n-summary" style="display:none">
+        <div class="cov-cards">
+          <div><b id="i18nTotal">0</b><span>可译字段</span></div>
+          <div><b id="i18nReviewed" style="color:var(--start)">0</b><span>已复核</span></div>
+          <div><b id="i18nPending" style="color:var(--orphan)">0</b><span>待复核</span></div>
+          <div><b id="i18nMissing" style="color:var(--coverage-miss)">0</b><span>缺失</span></div>
+        </div>
+        <div class="i18n-filters" id="i18nFilters">
+          <button class="i18n-filter active" data-filter="all">全部</button>
+          <button class="i18n-filter" data-filter="missing">仅缺失</button>
+          <button class="i18n-filter" data-filter="pending">仅待复核</button>
+          <button class="i18n-filter" data-filter="reviewed">仅已复核</button>
+        </div>
+      </div>
+
+      <!-- fields, grouped by node -->
+      <div id="i18nList" class="i18n-list"></div>
+    </div>
+    <footer>
+      <button data-close="i18nModal">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- share answer path funnel modal -->
+<div class="modal-mask" id="funnelModal">
+  <div class="modal wide">
+    <header>📈 分享作答路径漏斗<span class="close" data-close="funnelModal">✕</span></header>
+    <div class="body">
+      <p class="route-tip">
+        选择一个<b>已创建的只读分享快照</b>，服务端只读取<b>该快照</b>下的分享作答会话（编辑器预览与其他快照不计入），
+        按每次作答记录的<b>原脚本节点 ID 与选项 ID 顺序</b>构建路径前缀树：环路中重复选择同一选项仍保留在<b>不同深度</b>，不会按节点合并。
+        每个前缀显示<b>到达会话数、在此停止的未完成数、在此完成数</b>与<b>相对父路径的到达比例</b>；
+        节点/选项文案取自<b>快照原文</b>（受访者当时看到的文字），后续改稿不影响这里。点击任一行可列出到达该前缀的会话 ID。
+      </p>
+      <div class="field">
+        <label for="funnelSnapshot">分享快照（按创建时间倒序）</label>
+        <select id="funnelSnapshot"></select>
+      </div>
+      <div id="funnelMeta"></div>
+      <div id="funnelBody"></div>
+    </div>
+    <footer>
+      <button id="funnelRefresh">↻ 刷新漏斗</button>
+      <button data-close="funnelModal">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- share modal -->
+<div class="modal-mask" id="shareModal">
+  <div class="modal">
+    <header>只读分享链接<span class="close" data-close="shareModal">✕</span></header>
+    <div class="body">
+      <p style="margin:0 0 12px;color:var(--muted);font-size:13px">
+        链接打开的是生成分享时脚本的只读快照（受访者视角），后续编辑不影响已分享内容。</p>
+
+      <!-- switch between creating a new snapshot and managing an existing one -->
+      <div class="share-pick-row">
+        <label for="sharePick" style="white-space:nowrap">管理快照</label>
+        <select id="sharePick"></select>
+      </div>
+
+      <!-- create a NEW snapshot -->
+      <div id="shareCreateBox">
+        <div class="field">
+          <label for="shareLang">快照语言（逐字段展示该语言下当时已复核的译文，缺失/待复核字段回退原文）</label>
+          <select id="shareLang"></select>
+        </div>
+        <div style="margin:0 0 12px"><button class="primary" id="shareCreate">🔗 生成分享快照</button></div>
+      </div>
+
+      <!-- manage an ALREADY-CREATED snapshot: link + open rules + invites -->
+      <div id="shareResult" style="display:none">
+        <div class="share-link-row">
+          <input id="shareLink" readonly>
+          <button id="shareCopy">复制</button>
+        </div>
+        <div style="margin:10px 0 0" id="shareLangNote" class="i18n-lang-hint"></div>
+        <div style="margin-top:12px"><button class="primary" id="shareOpen">在新标签页打开</button></div>
+
+        <!-- answer-open rules: UTC start (inclusive) / deadline (exclusive) /
+             new-session cap. Unset = unlimited; rules gate only NEW sessions. -->
+        <div class="rule-box">
+          <h4>🕒 作答开放规则（仅限制新建作答，UTC 时间）</h4>
+          <p class="rule-hint">
+            三项可任意组合，<b>留空即不限制</b>：开始时间<b>含</b>该时刻、截止时间<b>不含</b>该时刻；
+            上限为正整数，指该快照<b>已创建的作答会话数</b>。规则只拦截<b>新建会话</b>——
+            受访者已开始的会话仍可继续作答、撤回与续答，编辑器「▶ 运行预览」不受任何限制。
+            保存时会校验开始必须早于截止、上限必须为正整数。</p>
+          <div class="rule-grid">
+            <div>
+              <label for="ruleStarted">UTC 开始时间（留空 = 不设下限）</label>
+              <input id="ruleStarted" type="datetime-local">
+            </div>
+            <div>
+              <label for="ruleDeadline">UTC 截止时间（留空 = 永不截止）</label>
+              <input id="ruleDeadline" type="datetime-local">
+            </div>
+            <div>
+              <label for="ruleMaxRuns">新建会话上限（正整数，留空 = 不限）</label>
+              <input id="ruleMaxRuns" type="number" min="1" step="1" placeholder="例如 100">
+            </div>
+          </div>
+          <div class="rule-actions">
+            <button class="primary" id="ruleSave">保存开放规则</button>
+            <button id="ruleClear">清除全部规则</button>
+            <button id="ruleRefresh">↻ 刷新状态</button>
+          </div>
+          <div id="ruleStatus" class="rule-status"></div>
+        </div>
+
+        <div class="invite-box">
+          <h4>🎫 邀请码（邀请制）</h4>
+          <p style="margin:0 0 10px;font-size:13px;color:var(--muted);line-height:1.7">
+          为<b>当前这个分享快照</b>开启邀请制后，受访者必须在分享页输入邀请码才能开始新的作答；
+          邀请码只属于该快照、一码仅可使用一次（核验、消耗与新建会话在同一数据库写事务中完成，
+          重复 / 跨快照 / 并发使用均被拒绝且不会新增会话）。公开链接、编辑器预览与凭续答令牌恢复均不受影响。</p>
+          <div class="invite-gen-row">
+            <label>批量生成
+              <input id="inviteCount" type="number" min="1" max="500" value="10">
+            </label>
+            <span>个随机邀请码</span>
+            <button class="primary" id="inviteGen">开启邀请制并生成</button>
+            <button id="inviteRefresh">↻ 刷新</button>
+          </div>
+          <div id="inviteStatus" class="invite-status"></div>
+          <div id="inviteCodes" class="invite-codes"></div>
+        </div>
+      </div>
+    </div>
+    <footer><button data-close="shareModal">关闭</button></footer>
+  </div>
+</div>
+
+<script src="/static/common.js"></script>
+<script src="/static/app.js"></script>
+<script>
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-close]");
+    if (b) closeModal(b.dataset.close);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      document.querySelectorAll(".modal-mask.open").forEach((m) => m.classList.remove("open"));
+    }
+  });
+</script>
+</body>
+</html>
