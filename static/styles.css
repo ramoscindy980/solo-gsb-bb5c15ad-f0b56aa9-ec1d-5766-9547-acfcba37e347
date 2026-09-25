@@ -617,6 +617,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .rule-pill.closed { background: #fee2e2; border-color: #fecaca; color: #991b1b; }
 .rule-pill.full { background: #ede9fe; border-color: #ddd6fe; color: #5b21b6; }
 .rule-meta { color: var(--muted); }
+.rule-loading, .invite-loading { color: var(--muted); font-size: 13px; }
 .rule-hint { margin: 0 0 10px; font-size: 12px; color: var(--muted); line-height: 1.7; }
 .share-pick-row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
 .share-pick-row select { flex: 1; }

@@ -1061,9 +1061,9 @@ function bindToolbar() {
   $("#sharePick").onchange = onSharePickChange;
   $("#ruleSave").onclick = saveShareRules;
   $("#ruleClear").onclick = clearShareRules;
-  $("#ruleRefresh").onclick = renderRuleStatus;
+  $("#ruleRefresh").onclick = onRuleRefresh;
   $("#inviteGen").onclick = generateInvites;
-  $("#inviteRefresh").onclick = loadInvites;
+  $("#inviteRefresh").onclick = () => loadInvites();
   $("#btnExport").onclick = exportJson;
   $("#btnImport").onclick = () => $("#importFile").click();
   $("#importFile").onchange = importJson;
@@ -1839,7 +1839,47 @@ function renderFunnelNode(node, isRoot) {
 
 // ---------------------------------------------------------------- share / preview
 
-const shareState = { token: null, url: "", shares: [], detail: null };
+// loadSeq is a monotonically increasing epoch bumped on every snapshot
+// selection. Every detail / open-status / invites response (and every save
+// follow-up) is bound to the epoch + token captured at request time; a response
+// whose epoch is no longer current comes from an abandoned selection (or an
+// in-flight save after switching) and must never touch the panel.
+const shareState = { token: null, url: "", shares: [], detail: null, loadSeq: 0, loaded: false };
+
+// Snapshot the token/epoch an async share-panel request belongs to.
+function shareRequestCtx() {
+  return { token: shareState.token, seq: shareState.loadSeq };
+}
+// True only while the panel still shows the snapshot that started the request.
+function isCurrentShareCtx(ctx) {
+  return !!ctx && ctx.seq === shareState.loadSeq && ctx.token === shareState.token;
+}
+
+// While a selected snapshot's detail is loading (or a rule save is in flight)
+// the rule form and save/clear/invite actions stay disabled, so a late response
+// can never be edited or re-saved into another snapshot. The refresh button is
+// intentionally kept enabled so a failed load can be retried.
+function setShareRulesLocked(locked) {
+  for (const id of ["ruleStarted", "ruleDeadline", "ruleMaxRuns",
+    "ruleSave", "ruleClear", "inviteGen", "inviteRefresh", "inviteCount"]) {
+    const el = $(`#${id}`);
+    if (el) el.disabled = locked;
+  }
+}
+
+// Reset the manage panel to its "switching snapshots" state: blank inputs,
+// action buttons locked, explicit loading placeholders.
+function showSharePanelLoading() {
+  setShareRulesLocked(true);
+  shareState.loaded = false;
+  $("#ruleStarted").value = "";
+  $("#ruleDeadline").value = "";
+  $("#ruleMaxRuns").value = "";
+  $("#ruleStatus").innerHTML = `<span class="rule-loading">⏳ 正在加载快照详情与开放规则…</span>`;
+  $("#inviteStatus").innerHTML = `<span class="invite-loading">⏳ 正在加载邀请码…</span>`;
+  $("#inviteCodes").innerHTML = "";
+  $("#shareLangNote").innerHTML = "";
+}
 
 async function openShare() {
   if (!state.currentId) return;
@@ -1859,6 +1899,10 @@ async function openShare() {
   }
   shareState.token = null;
   shareState.detail = null;
+  shareState.loaded = false;
+  // New modal session: invalidate any detail/status/save responses still in
+  // flight from a previous open of this modal.
+  shareState.loadSeq++;
   $("#shareLangNote").innerHTML = "";
   openModal("shareModal");
   await refreshSharePick(state.currentId, true);
@@ -1867,6 +1911,8 @@ async function openShare() {
 }
 
 // Load the script's snapshot list and populate the "manage snapshot" picker.
+// Returns the token now selected (or null); when the selection changes here
+// the caller is responsible for bumping the request epoch.
 async function refreshSharePick(scriptId, selectFirst = false) {
   const sel = $("#sharePick");
   try {
@@ -1878,7 +1924,7 @@ async function refreshSharePick(scriptId, selectFirst = false) {
     sel.innerHTML = `<option value="">（暂无已创建快照，请先生成一个）</option>`;
     sel.disabled = true;
     showShareCreateBox();
-    return;
+    return null;
   }
   sel.disabled = false;
   sel.innerHTML = shareState.shares.map((s) => {
@@ -1894,6 +1940,7 @@ async function refreshSharePick(scriptId, selectFirst = false) {
     shareState.token = shareState.shares[0].token;
   }
   sel.value = shareState.token;
+  return shareState.token;
 }
 
 function showShareCreateBox() {
@@ -1902,34 +1949,77 @@ function showShareCreateBox() {
 }
 
 async function onSharePickChange() {
-  shareState.token = $("#sharePick").value || null;
-  if (!shareState.token) { showShareCreateBox(); return; }
+  const token = $("#sharePick").value || null;
+  if (!token) {
+    // No snapshot to manage: invalidate the previous selection's responses.
+    shareState.token = null;
+    shareState.detail = null;
+    shareState.loaded = false;
+    shareState.loadSeq++;
+    showShareCreateBox();
+    return;
+  }
+  // A new selection supersedes the previous one: bump the epoch and lock the
+  // rule form until THIS snapshot's detail arrives.
+  shareState.token = token;
+  shareState.loadSeq++;
   await loadExistingShare();
 }
 
 // Load one created snapshot: link/language note, answer-open rules and invites.
 async function loadExistingShare() {
-  if (!shareState.token) return;
+  const ctx = shareRequestCtx();
+  if (!ctx.token) return;
   $("#shareCreateBox").style.display = "none";
   $("#shareResult").style.display = "";
-  shareState.url = `${location.origin}/share.html?token=${encodeURIComponent(shareState.token)}`;
+  shareState.url = `${location.origin}/share.html?token=${encodeURIComponent(ctx.token)}`;
   $("#shareLink").value = shareState.url;
   $("#shareOpen").onclick = () => window.open(shareState.url, "_blank");
   $("#shareCopy").onclick = () => {
     copyText(shareState.url).then((ok) => toast(ok ? "链接已复制" : "复制失败，请手动选择复制"));
   };
-  try {
-    const [detail] = await Promise.all([
-      api(`/api/share/${encodeURIComponent(shareState.token)}`),
-      loadInvites(),
-    ]);
+  // Lock the rule form for the duration of this selection's load. Detail and
+  // invites are fetched together, but each rejects independently so one failed
+  // request cannot leave a stale response from the other snapshot on screen.
+  showSharePanelLoading();
+  const [detailResult, invitesResult] = await Promise.allSettled([
+    api(`/api/share/${encodeURIComponent(ctx.token)}`),
+    api(`/api/share/${encodeURIComponent(ctx.token)}/invites`),
+  ]);
+
+  // Switched away (to another snapshot, to create-mode, or closed/reopened)
+  // while requests were in flight: their results belong to an abandoned
+  // selection and must not fill the current panel.
+  if (!isCurrentShareCtx(ctx)) return;
+
+  if (detailResult.status === "fulfilled") {
+    const detail = detailResult.value;
     shareState.detail = detail;
+    shareState.loaded = true;
     renderShareLangNote(detail);
     fillRuleFields(detail);
-    await renderRuleStatus();
-  } catch (err) {
-    toast("快照信息加载失败：" + err.message, 3500);
+    // Detail is authoritative for the selected snapshot: editing is allowed
+    // only now that the form actually holds this snapshot's rules.
+    setShareRulesLocked(false);
+  } else {
+    // Keep the form locked (empty inputs) on failure — an unlocked form would
+    // let empty/half-loaded values be saved. ruleRefresh stays available to
+    // retry, and renderRuleStatus() below already shows the error state.
+    shareState.detail = null;
+    shareState.loaded = false;
+    $("#shareLangNote").innerHTML =
+      `<span class="invite-err">快照详情加载失败：${esc(detailResult.reason?.message || "请重试")}</span>`;
+    toast("快照信息加载失败：" + (detailResult.reason?.message || ""), 3500);
   }
+  if (invitesResult.status === "fulfilled") {
+    renderInvites(invitesResult.value, $("#inviteStatus"), $("#inviteCodes"));
+  } else {
+    $("#inviteStatus").innerHTML =
+      `<span class="invite-err">邀请码状态加载失败：${esc(invitesResult.reason?.message || "")}</span>`;
+    $("#inviteCodes").innerHTML = "";
+  }
+  // Open-status pill (independent request); stale responses are filtered inside.
+  await renderRuleStatus(ctx);
 }
 
 function renderShareLangNote(detail) {
@@ -1960,7 +2050,11 @@ async function createShareSnapshot() {
       method: "POST",
       body: langCode ? { lang_code: langCode } : {},
     });
+    // The new snapshot is a brand-new selection: supersede anything in flight.
     shareState.token = r.token;
+    shareState.detail = null;
+    shareState.loaded = false;
+    shareState.loadSeq++;
     toast("分享快照已创建");
     // Refresh the picker (keeping the new snapshot selected), then open it.
     await refreshSharePick(state.currentId, false);
@@ -1989,10 +2083,18 @@ function fillRuleFields(detail) {
   $("#ruleMaxRuns").value = detail.max_new_runs ?? "";
 }
 
-async function renderRuleStatus() {
+// Render the open-status pill. `ctx` binds the request to the snapshot
+// selection that initiated it; an omitted ctx captures the current selection.
+async function renderRuleStatus(ctx = shareRequestCtx()) {
   const el = $("#ruleStatus");
+  if (!ctx || !ctx.token) {
+    el.innerHTML = "";
+    return;
+  }
   try {
-    const r = await api(`/api/share/${encodeURIComponent(shareState.token)}/rules`);
+    const r = await api(`/api/share/${encodeURIComponent(ctx.token)}/rules`);
+    // Late status response for a snapshot no longer shown: drop it entirely.
+    if (!isCurrentShareCtx(ctx)) return;
     const labels = {
       open: ["open", "🟢 当前开放：可新建作答"],
       not_started: ["not_started", "⏳ 未开放：到达开始时间后才可新建作答"],
@@ -2012,8 +2114,17 @@ async function renderRuleStatus() {
     el.innerHTML = `<span class="rule-pill ${cls}">${text}</span>
       <span class="rule-meta">${meta.join(" · ")}</span>`;
   } catch (err) {
+    if (!isCurrentShareCtx(ctx)) return;
     el.innerHTML = `<span class="invite-err">开放状态加载失败：${esc(err.message)}</span>`;
   }
+}
+
+// "↻ 刷新状态": if the snapshot detail never arrived (failed load keeps the
+// form locked), retry the whole load; otherwise just re-fetch the status pill.
+async function onRuleRefresh() {
+  if (!shareState.token) return;
+  if (!shareState.loaded) await loadExistingShare();
+  else await renderRuleStatus();
 }
 
 function collectRulePayload() {
@@ -2038,7 +2149,11 @@ function collectRulePayload() {
 }
 
 async function saveShareRules() {
-  if (!shareState.token) return;
+  // Pin the form to the snapshot selected at click time. Switching snapshots
+  // during the request can never redirect this PUT or backfill the new panel.
+  const ctx = shareRequestCtx();
+  if (!ctx || !ctx.token) return;
+  if (!shareState.loaded) { toast("快照详情尚未加载完成，请稍候再保存"); return; }
   let payload;
   try {
     payload = collectRulePayload();
@@ -2048,44 +2163,91 @@ async function saveShareRules() {
   }
   const btn = $("#ruleSave");
   btn.disabled = true;
+  $("#ruleClear").disabled = true;
+  $("#ruleStatus").innerHTML = `<span class="rule-loading">💾 正在保存开放规则…</span>`;
   try {
-    const r = await api(`/api/share/${encodeURIComponent(shareState.token)}/rules`, {
+    const r = await api(`/api/share/${encodeURIComponent(ctx.token)}/rules`, {
       method: "PUT", body: payload,
     });
-    fillRuleFields(r);
-    await renderRuleStatus();
-    await refreshSharePick(state.currentId, false);
-    toast("作答开放规则已保存");
+    const stale = !isCurrentShareCtx(ctx);
+    // The save succeeded on the form's own snapshot even if the user has since
+    // switched to another one; say so but never touch the newly shown panel.
+    if (stale) {
+      toast(`已保存到提交时所选快照（${ctx.token.slice(0, 6)}…），当前面板为另一个快照`);
+    } else {
+      fillRuleFields(r);
+      toast("作答开放规则已保存");
+    }
+    // Refresh follow-ups are bound to the save's context: the status pill
+    // ignores stale responses, and the picker re-list keeps the newly selected
+    // snapshot (its token is preserved by refreshSharePick).
+    await Promise.all([
+      renderRuleStatus(ctx),
+      refreshSharePick(state.currentId, false),
+    ]);
   } catch (err) {
-    toast("保存失败：" + err.message, 3500);
+    if (isCurrentShareCtx(ctx)) {
+      toast("保存失败：" + err.message, 3500);
+      await renderRuleStatus(ctx);
+    } else {
+      toast("原快照规则保存失败：" + err.message, 3500);
+    }
+  } finally {
+    // Only restore the buttons for the panel this save belongs to, and only
+    // once its own load has finished. A newer selection (same panel locked
+    // while ITS detail loads) must stay locked regardless of this save.
+    if (isCurrentShareCtx(ctx) && shareState.loaded) setShareRulesLocked(false);
   }
-  btn.disabled = false;
 }
 
 async function clearShareRules() {
-  if (!shareState.token) return;
+  // Capture the form-owned snapshot before the confirm dialog and the request:
+  // switching snapshots mid-flight cannot clear rules on the wrong snapshot.
+  const ctx = shareRequestCtx();
+  if (!ctx || !ctx.token) return;
+  if (!shareState.loaded) { toast("快照详情尚未加载完成，请稍候再操作"); return; }
   if (!confirm("清除该快照的全部作答开放规则（开始时间、截止时间、新建会话上限）？清除后将不限制新建作答。")) return;
+  const btn = $("#ruleClear");
+  btn.disabled = true;
+  $("#ruleSave").disabled = true;
+  $("#ruleStatus").innerHTML = `<span class="rule-loading">正在清除开放规则…</span>`;
   try {
-    const r = await api(`/api/share/${encodeURIComponent(shareState.token)}/rules`, {
+    const r = await api(`/api/share/${encodeURIComponent(ctx.token)}/rules`, {
       method: "PUT",
       body: { open_started_at: null, open_deadline_at: null, max_new_runs: null },
     });
-    fillRuleFields(r);
-    await renderRuleStatus();
-    await refreshSharePick(state.currentId, false);
-    toast("已清除全部开放规则，当前不限制新建作答");
+    if (isCurrentShareCtx(ctx)) {
+      fillRuleFields(r);
+      toast("已清除全部开放规则，当前不限制新建作答");
+    } else {
+      toast(`已清除提交时所选快照（${ctx.token.slice(0, 6)}…）的开放规则`);
+    }
+    await Promise.all([
+      renderRuleStatus(ctx),
+      refreshSharePick(state.currentId, false),
+    ]);
   } catch (err) {
-    toast("清除失败：" + err.message, 3500);
+    if (isCurrentShareCtx(ctx)) {
+      toast("清除失败：" + err.message, 3500);
+      await renderRuleStatus(ctx);
+    } else {
+      toast("原快照规则清除失败：" + err.message, 3500);
+    }
+  } finally {
+    if (isCurrentShareCtx(ctx) && shareState.loaded) setShareRulesLocked(false);
   }
 }
 
-async function loadInvites() {
-  if (!shareState.token) return;
+async function loadInvites(ctx = shareRequestCtx()) {
   const statusEl = $("#inviteStatus"), codesEl = $("#inviteCodes");
+  if (!ctx || !ctx.token) return;
   try {
-    const r = await api(`/api/share/${encodeURIComponent(shareState.token)}/invites`);
+    const r = await api(`/api/share/${encodeURIComponent(ctx.token)}/invites`);
+    // Late response from a previously selected snapshot: never render it.
+    if (!isCurrentShareCtx(ctx)) return;
     renderInvites(r, statusEl, codesEl);
   } catch (err) {
+    if (!isCurrentShareCtx(ctx)) return;
     statusEl.innerHTML = `<span class="invite-err">邀请码状态加载失败：${esc(err.message)}</span>`;
     codesEl.innerHTML = "";
   }
@@ -2116,21 +2278,31 @@ function renderInvites(r, statusEl, codesEl) {
 }
 
 async function generateInvites() {
-  if (!shareState.token) return;
+  // Bind generation to the snapshot shown when the button was clicked; the
+  // response must not be rendered after switching to another snapshot.
+  const ctx = shareRequestCtx();
+  if (!ctx || !ctx.token) return;
+  if (!shareState.loaded) { toast("快照详情尚未加载完成，请稍候再操作"); return; }
   const count = Math.max(1, Math.min(500, Number($("#inviteCount").value) || 0));
   if (count < 1) { toast("请输入 1～500 的数量"); return; }
-  $("#inviteCount").value = count;
+  if (isCurrentShareCtx(ctx)) $("#inviteCount").value = count;
   const btn = $("#inviteGen");
   btn.disabled = true;
   try {
-    const r = await api(`/api/share/${encodeURIComponent(shareState.token)}/invites`,
+    const r = await api(`/api/share/${encodeURIComponent(ctx.token)}/invites`,
       { method: "POST", body: { count } });
-    renderInvites(r, $("#inviteStatus"), $("#inviteCodes"));
-    toast(`已生成 ${r.created.length} 个邀请码（未用 ${r.unused_count} / 共 ${r.total}）`);
+    if (isCurrentShareCtx(ctx)) {
+      renderInvites(r, $("#inviteStatus"), $("#inviteCodes"));
+      toast(`已生成 ${r.created.length} 个邀请码（未用 ${r.unused_count} / 共 ${r.total}）`);
+    } else {
+      toast(`已为提交时所选快照（${ctx.token.slice(0, 6)}…）生成邀请码`);
+    }
   } catch (err) {
-    toast("生成失败：" + err.message, 3500);
+    if (isCurrentShareCtx(ctx)) toast("生成失败：" + err.message, 3500);
+    else toast("原快照邀请码生成失败：" + err.message, 3500);
+  } finally {
+    if (isCurrentShareCtx(ctx)) btn.disabled = false;
   }
-  btn.disabled = false;
 }
 
 let runId = null;
