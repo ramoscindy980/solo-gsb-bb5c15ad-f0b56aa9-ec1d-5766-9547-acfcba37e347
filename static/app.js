@@ -1061,9 +1061,9 @@ function bindToolbar() {
   $("#sharePick").onchange = onSharePickChange;
   $("#ruleSave").onclick = saveShareRules;
   $("#ruleClear").onclick = clearShareRules;
-  $("#ruleRefresh").onclick = renderRuleStatus;
+  $("#ruleRefresh").onclick = () => renderRuleStatus();
   $("#inviteGen").onclick = generateInvites;
-  $("#inviteRefresh").onclick = loadInvites;
+  $("#inviteRefresh").onclick = () => loadInvites();
   $("#btnExport").onclick = exportJson;
   $("#btnImport").onclick = () => $("#importFile").click();
   $("#importFile").onchange = importJson;
@@ -1839,7 +1839,16 @@ function renderFunnelNode(node, isRoot) {
 
 // ---------------------------------------------------------------- share / preview
 
-const shareState = { token: null, url: "", shares: [], detail: null };
+// token: the snapshot currently selected in the picker. Every async load/save
+// below PINS the token it started with and, before painting results into the
+// panel, verifies it is still the selected one — a slow response for a
+// snapshot the user has already switched away from is dropped, never
+// backfilled into the current panel.
+const shareState = {
+  token: null, url: "", shares: [], detail: null,
+  loaded: false,   // current token's detail is in the form (rule editing unlocked)
+  saving: false,   // a rule save/clear request is in flight
+};
 
 async function openShare() {
   if (!state.currentId) return;
@@ -1859,6 +1868,8 @@ async function openShare() {
   }
   shareState.token = null;
   shareState.detail = null;
+  shareState.loaded = false;
+  shareState.saving = false;
   $("#shareLangNote").innerHTML = "";
   openModal("shareModal");
   await refreshSharePick(state.currentId, true);
@@ -1908,11 +1919,18 @@ async function onSharePickChange() {
 }
 
 // Load one created snapshot: link/language note, answer-open rules and invites.
+// The token is pinned at entry; if the user switches to another snapshot while
+// the requests are in flight, the late responses are dropped instead of being
+// backfilled into the panel (which would let a save write them into the WRONG
+// snapshot). Rule editing stays locked until this snapshot's detail is loaded.
 async function loadExistingShare() {
-  if (!shareState.token) return;
+  const token = shareState.token;   // pin: everything below belongs to THIS snapshot
+  if (!token) return;
   $("#shareCreateBox").style.display = "none";
   $("#shareResult").style.display = "";
-  shareState.url = `${location.origin}/share.html?token=${encodeURIComponent(shareState.token)}`;
+  shareState.loaded = false;        // switching: lock rule editing until load completes
+  syncRuleEditingEnabled();
+  shareState.url = `${location.origin}/share.html?token=${encodeURIComponent(token)}`;
   $("#shareLink").value = shareState.url;
   $("#shareOpen").onclick = () => window.open(shareState.url, "_blank");
   $("#shareCopy").onclick = () => {
@@ -1920,14 +1938,18 @@ async function loadExistingShare() {
   };
   try {
     const [detail] = await Promise.all([
-      api(`/api/share/${encodeURIComponent(shareState.token)}`),
-      loadInvites(),
+      api(`/api/share/${encodeURIComponent(token)}`),
+      loadInvites(token),
     ]);
+    if (token !== shareState.token) return;   // switched away while loading: drop the stale detail
     shareState.detail = detail;
     renderShareLangNote(detail);
     fillRuleFields(detail);
-    await renderRuleStatus();
+    shareState.loaded = true;                 // form now shows THIS snapshot: allow editing
+    syncRuleEditingEnabled();
+    await renderRuleStatus(token);
   } catch (err) {
+    if (token !== shareState.token) return;   // stale failure: the current panel keeps its own state
     toast("快照信息加载失败：" + err.message, 3500);
   }
 }
@@ -1989,10 +2011,22 @@ function fillRuleFields(detail) {
   $("#ruleMaxRuns").value = detail.max_new_runs ?? "";
 }
 
-async function renderRuleStatus() {
+// Rule inputs and save/clear stay locked while a snapshot load or a rule save
+// is in flight: a half-loaded (or another snapshot's) form can never be saved.
+function syncRuleEditingEnabled() {
+  const enabled = !!shareState.token && shareState.loaded && !shareState.saving;
+  ["#ruleStarted", "#ruleDeadline", "#ruleMaxRuns", "#ruleSave", "#ruleClear"]
+    .forEach((sel) => { $(sel).disabled = !enabled; });
+}
+
+// Open-state pill + session-count line, bound to the token passed in: a slow
+// response for a snapshot that is no longer selected is discarded.
+async function renderRuleStatus(token = shareState.token) {
   const el = $("#ruleStatus");
+  if (!token) { el.innerHTML = ""; return; }
   try {
-    const r = await api(`/api/share/${encodeURIComponent(shareState.token)}/rules`);
+    const r = await api(`/api/share/${encodeURIComponent(token)}/rules`);
+    if (token !== shareState.token) return;   // stale: belongs to a snapshot no longer shown
     const labels = {
       open: ["open", "🟢 当前开放：可新建作答"],
       not_started: ["not_started", "⏳ 未开放：到达开始时间后才可新建作答"],
@@ -2012,6 +2046,7 @@ async function renderRuleStatus() {
     el.innerHTML = `<span class="rule-pill ${cls}">${text}</span>
       <span class="rule-meta">${meta.join(" · ")}</span>`;
   } catch (err) {
+    if (token !== shareState.token) return;   // stale failure: keep the current panel's status
     el.innerHTML = `<span class="invite-err">开放状态加载失败：${esc(err.message)}</span>`;
   }
 }
@@ -2038,7 +2073,11 @@ function collectRulePayload() {
 }
 
 async function saveShareRules() {
-  if (!shareState.token) return;
+  // Pin the snapshot this form belongs to: the PUT target and any panel
+  // backfill are bound to it, so switching snapshots mid-save can neither
+  // retarget the request nor paint the old snapshot's result into the panel.
+  const token = shareState.token;
+  if (!token || shareState.saving || !shareState.loaded) return;
   let payload;
   try {
     payload = collectRulePayload();
@@ -2046,46 +2085,64 @@ async function saveShareRules() {
     toast(err.message);
     return;
   }
-  const btn = $("#ruleSave");
-  btn.disabled = true;
+  shareState.saving = true;
+  syncRuleEditingEnabled();
   try {
-    const r = await api(`/api/share/${encodeURIComponent(shareState.token)}/rules`, {
+    const r = await api(`/api/share/${encodeURIComponent(token)}/rules`, {
       method: "PUT", body: payload,
     });
-    fillRuleFields(r);
-    await renderRuleStatus();
+    if (token === shareState.token) {
+      // Still the selected snapshot: reflect the saved rules in the form.
+      fillRuleFields(r);
+      await renderRuleStatus(token);
+    }
+    // else: switched away mid-save — the save landed on the pinned snapshot,
+    // but its result must not be backfilled into the newly shown panel.
     await refreshSharePick(state.currentId, false);
     toast("作答开放规则已保存");
   } catch (err) {
     toast("保存失败：" + err.message, 3500);
+  } finally {
+    shareState.saving = false;
+    syncRuleEditingEnabled();
   }
-  btn.disabled = false;
 }
 
 async function clearShareRules() {
-  if (!shareState.token) return;
+  const token = shareState.token;   // pin the snapshot this form belongs to
+  if (!token || shareState.saving || !shareState.loaded) return;
   if (!confirm("清除该快照的全部作答开放规则（开始时间、截止时间、新建会话上限）？清除后将不限制新建作答。")) return;
+  shareState.saving = true;
+  syncRuleEditingEnabled();
   try {
-    const r = await api(`/api/share/${encodeURIComponent(shareState.token)}/rules`, {
+    const r = await api(`/api/share/${encodeURIComponent(token)}/rules`, {
       method: "PUT",
       body: { open_started_at: null, open_deadline_at: null, max_new_runs: null },
     });
-    fillRuleFields(r);
-    await renderRuleStatus();
+    if (token === shareState.token) {
+      fillRuleFields(r);
+      await renderRuleStatus(token);
+    }
+    // else: switched away mid-clear — never backfill into the new panel.
     await refreshSharePick(state.currentId, false);
     toast("已清除全部开放规则，当前不限制新建作答");
   } catch (err) {
     toast("清除失败：" + err.message, 3500);
+  } finally {
+    shareState.saving = false;
+    syncRuleEditingEnabled();
   }
 }
 
-async function loadInvites() {
-  if (!shareState.token) return;
+async function loadInvites(token = shareState.token) {
+  if (!token) return;
   const statusEl = $("#inviteStatus"), codesEl = $("#inviteCodes");
   try {
-    const r = await api(`/api/share/${encodeURIComponent(shareState.token)}/invites`);
+    const r = await api(`/api/share/${encodeURIComponent(token)}/invites`);
+    if (token !== shareState.token) return;   // stale: another snapshot is now shown
     renderInvites(r, statusEl, codesEl);
   } catch (err) {
+    if (token !== shareState.token) return;   // stale failure: keep the current panel's state
     statusEl.innerHTML = `<span class="invite-err">邀请码状态加载失败：${esc(err.message)}</span>`;
     codesEl.innerHTML = "";
   }
@@ -2116,16 +2173,19 @@ function renderInvites(r, statusEl, codesEl) {
 }
 
 async function generateInvites() {
-  if (!shareState.token) return;
+  const token = shareState.token;   // pin: codes are generated for THIS snapshot
+  if (!token) return;
   const count = Math.max(1, Math.min(500, Number($("#inviteCount").value) || 0));
   if (count < 1) { toast("请输入 1～500 的数量"); return; }
   $("#inviteCount").value = count;
   const btn = $("#inviteGen");
   btn.disabled = true;
   try {
-    const r = await api(`/api/share/${encodeURIComponent(shareState.token)}/invites`,
+    const r = await api(`/api/share/${encodeURIComponent(token)}/invites`,
       { method: "POST", body: { count } });
-    renderInvites(r, $("#inviteStatus"), $("#inviteCodes"));
+    // Switched away mid-generation: the codes exist on the pinned snapshot,
+    // but its list must not be painted over the newly shown panel.
+    if (token === shareState.token) renderInvites(r, $("#inviteStatus"), $("#inviteCodes"));
     toast(`已生成 ${r.created.length} 个邀请码（未用 ${r.unused_count} / 共 ${r.total}）`);
   } catch (err) {
     toast("生成失败：" + err.message, 3500);
